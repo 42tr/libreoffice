@@ -1,0 +1,6 @@
+.git
+.gitea
+.github
+__pycache__/
+*.pyc
+LibreOffice_*_Linux_*_deb.tar.gz
