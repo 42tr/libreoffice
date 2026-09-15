@@ -1,12 +1,14 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 import logging
 import os
 import shutil
+import subprocess
 import time
 import uuid
 
-from libreoffice_client import convert
+from libreoffice_client import ConversionBusyError, convert
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,7 +23,9 @@ os.makedirs(BASE_DIR, exist_ok=True)
 
 
 @app.post("/convert")
-async def convert_api(file: UploadFile = File(...), target_format: str = "pdf"):
+def convert_api(file: UploadFile = File(...), target_format: str = "pdf"):
+    # FastAPI runs synchronous endpoints in its thread pool, keeping the event
+    # loop free while copying files, waiting for a slot, and running soffice.
     started_at = time.perf_counter()
     filename = file.filename
     if not filename:
@@ -32,57 +36,44 @@ async def convert_api(file: UploadFile = File(...), target_format: str = "pdf"):
     work_dir = os.path.join(BASE_DIR, task_id)
     os.makedirs(work_dir, exist_ok=True)
 
-    input_ext = os.path.splitext(filename)[1]
-    input_path = os.path.join(work_dir, f"source{input_ext}")
-
-    # 保存文件
-    with open(input_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    logger.info("Received file for conversion: task_id=%s filename=%s target=%s", task_id, filename, target_format)
-
-    output_file = os.path.splitext(filename)[0] + "." + target_format
-    output_path = os.path.join(work_dir, f"result.{target_format}")
-
     try:
-        convert(input_path, output_path, target_format)
-    except ValueError as e:
-        logger.warning(
-            "Invalid conversion request: task_id=%s filename=%s target=%s error=%s",
-            task_id,
-            filename,
-            target_format,
-            e,
+        input_ext = os.path.splitext(filename)[1]
+        input_path = os.path.join(work_dir, f"source{input_ext}")
+        with open(input_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        logger.info(
+            "Received file for conversion: task_id=%s filename=%s target=%s",
+            task_id, filename, target_format,
         )
-        raise HTTPException(400, str(e))
+        output_file = os.path.splitext(filename)[0] + "." + target_format
+        output_path = os.path.join(work_dir, f"result.{target_format}")
+        convert(input_path, output_path, target_format)
+        if not os.path.isfile(output_path):
+            raise RuntimeError("输出文件不存在")
+
+        logger.info(
+            "Conversion completed: task_id=%s filename=%s target=%s elapsed=%.2fs size=%s",
+            task_id, filename, target_format,
+            time.perf_counter() - started_at, os.path.getsize(output_path),
+        )
+        response = FileResponse(
+            output_path,
+            filename=output_file,
+            media_type="application/octet-stream",
+            background=BackgroundTask(shutil.rmtree, work_dir, ignore_errors=True),
+        )
     except Exception as e:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        if isinstance(e, ValueError):
+            raise HTTPException(400, str(e)) from e
+        if isinstance(e, ConversionBusyError):
+            raise HTTPException(503, str(e), headers={"Retry-After": "5"}) from e
+        if isinstance(e, subprocess.TimeoutExpired):
+            logger.warning("Conversion timed out: task_id=%s", task_id)
+            raise HTTPException(504, "转换超时") from e
         logger.exception(
             "Conversion failed: task_id=%s filename=%s target=%s",
-            task_id,
-            filename,
-            target_format,
+            task_id, filename, target_format,
         )
-        raise HTTPException(500, f"转换失败: {str(e)}")
-
-    if not os.path.exists(output_path):
-        logger.error(
-            "Conversion finished without output file: task_id=%s filename=%s target=%s",
-            task_id,
-            filename,
-            target_format,
-        )
-        raise HTTPException(500, "输出文件不存在")
-
-    logger.info(
-        "Conversion completed: task_id=%s filename=%s target=%s elapsed=%.2fs size=%s",
-        task_id,
-        filename,
-        target_format,
-        time.perf_counter() - started_at,
-        os.path.getsize(output_path),
-    )
-
-    return FileResponse(
-        output_path,
-        filename=output_file,
-        media_type="application/octet-stream"
-    )
+        raise HTTPException(500, f"转换失败: {str(e)}") from e
+    return response
