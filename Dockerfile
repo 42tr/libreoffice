@@ -39,6 +39,8 @@ RUN set -eux; \
 RUN apt-fast update && apt-fast install -y \
     python3 \
     python3-pip \
+    # Render PDF pages to PNG/JPEG
+    poppler-utils \
     # Timezone data
     tzdata \
     # sqlite3

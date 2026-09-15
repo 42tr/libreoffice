@@ -12,6 +12,7 @@ from unittest.mock import patch
 import urllib.error
 import urllib.request
 import zipfile
+from PIL import Image
 
 import main
 import uvicorn
@@ -44,19 +45,22 @@ class ApiTests(unittest.TestCase):
         cls.base_patch.stop()
         cls.temp.cleanup()
 
-    def post(self, content=b'hello', fmt='pdf'):
+    def post(self, content=b'hello', fmt='pdf', filename='same.txt', with_headers=False, page=None):
         boundary = 'conversion-test-boundary'
         body = (b'--' + boundary.encode() +
-                b'\r\nContent-Disposition: form-data; name="file"; filename="same.txt"\r\n'
+                ('\r\nContent-Disposition: form-data; name="file"; filename="%s"\r\n' % filename).encode() +
                 b'Content-Type: text/plain\r\n\r\n' + content +
                 b'\r\n--' + boundary.encode() + b'--\r\n')
         request = urllib.request.Request(
-            self.url + '/convert?target_format=' + fmt, data=body,
+            self.url + '/convert?target_format=' + fmt + ('' if page is None else '&page=' + str(page)), data=body,
             headers={'Content-Type': 'multipart/form-data; boundary=' + boundary})
         try:
             with urllib.request.urlopen(request, timeout=240) as response:
-                return response.status, response.read()
+                return ((response.status, response.read(), response.headers) if with_headers
+                        else (response.status, response.read()))
         except urllib.error.HTTPError as response:
+            if with_headers:
+                return response.code, response.read(), response.headers
             return response.code, response.read()
 
     def assert_clean(self):
@@ -69,11 +73,12 @@ class ApiTests(unittest.TestCase):
         barrier = threading.Barrier(3)
         release = threading.Event()
 
-        def convert(source, target, fmt):
+        def convert(source, target, fmt, page=None):
             barrier.wait(timeout=10)
             if not release.wait(timeout=10):
                 raise RuntimeError('conversion was not released')
             Path(target).write_bytes(Path(source).read_bytes())
+            return Path(target)
 
         with patch.object(main, 'convert', side_effect=convert):
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
@@ -96,6 +101,61 @@ class ApiTests(unittest.TestCase):
             with self.subTest(status=status), patch.object(main, 'convert', side_effect=error):
                 self.assertEqual(self.post()[0], status)
                 self.assert_clean()
+
+    @unittest.skipUnless(os.getenv('RUN_IMAGE_TESTS') == '1', 'requires pdftoppm')
+    def test_real_pdf_images(self):
+        from test_images import make_pdf
+        for fmt in ('png', 'jpg', 'jpeg'):
+            for count in (1, 2):
+                with self.subTest(fmt=fmt, pages=count):
+                    status, body, headers = self.post(
+                        make_pdf(count), fmt, 'document.pdf', with_headers=True)
+                    self.assertEqual(status, 200, body)
+                    magic = b'\x89PNG\r\n\x1a\n' if fmt == 'png' else b'\xff\xd8\xff'
+                    self.assertTrue(body.startswith(magic))
+                    self.assertEqual(headers['Content-Type'],
+                                     'image/png' if fmt == 'png' else 'image/jpeg')
+                    self.assertIn('document.' + fmt, headers['Content-Disposition'])
+                    with Image.open(io.BytesIO(body)) as image:
+                        self.assertEqual(image.size, (150, 150 * count))
+                        self.assertGreater(image.getpixel((75, 75))[2], 240)
+                        if count == 2:
+                            self.assertGreater(image.getpixel((75, 225))[0], 240)
+                    self.assert_clean()
+
+    @unittest.skipUnless(os.getenv('RUN_IMAGE_TESTS') == '1', 'requires soffice and pdftoppm')
+    def test_real_office_to_images(self):
+        document = (b'<html><body><p>First page</p>'
+                    b'<p style="page-break-before:always">Second page</p></body></html>')
+        status, body = self.post(document, 'png', 'document.html')
+        self.assertEqual(status, 200, body)
+        with Image.open(io.BytesIO(body)) as image:
+            self.assertEqual(image.format, 'PNG')
+            self.assertGreater(image.height, image.width * 2)
+        self.assert_clean()
+
+    def test_invalid_page_parameters(self):
+        for page in (0, -1, 'abc', '1.5'):
+            self.assertEqual(self.post(fmt='png', page=page)[0], 422)
+        self.assertEqual(self.post(fmt='pdf', page=1)[0], 400)
+        self.assert_clean()
+
+    @unittest.skipUnless(os.getenv('RUN_IMAGE_TESTS') == '1', 'requires pdftoppm')
+    def test_real_selected_page(self):
+        from test_images import make_pdf
+        for fmt in ('png', 'jpg', 'jpeg'):
+            for page in (1, 2):
+                status, body = self.post(make_pdf(2), fmt, 'document.pdf', page=page)
+                self.assertEqual(status, 200, body)
+                with Image.open(io.BytesIO(body)) as image:
+                    self.assertEqual(image.size, (150, 150))
+                    channel = 2 if page == 1 else 0
+                    self.assertGreater(image.getpixel((75, 75))[channel], 240)
+                self.assert_clean()
+        status, body = self.post(make_pdf(2), 'png', 'document.pdf', page=3)
+        self.assertEqual(status, 400, body)
+        self.assertIn('共 2 页', body.decode())
+        self.assert_clean()
 
     @unittest.skipUnless(os.getenv('RUN_LIBREOFFICE_TESTS') == '1', 'requires soffice')
     def test_real_parallel_conversions(self):

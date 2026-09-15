@@ -1,8 +1,9 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 import logging
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import time
@@ -23,7 +24,10 @@ os.makedirs(BASE_DIR, exist_ok=True)
 
 
 @app.post("/convert")
-def convert_api(file: UploadFile = File(...), target_format: str = "pdf"):
+def convert_api(
+    file: UploadFile = File(...), target_format: str = "pdf",
+    page: int | None = Query(None, ge=1, description="图片页码，从 1 开始；不传则纵向拼接所有页"),
+):
     # FastAPI runs synchronous endpoints in its thread pool, keeping the event
     # loop free while copying files, waiting for a slot, and running soffice.
     started_at = time.perf_counter()
@@ -45,9 +49,10 @@ def convert_api(file: UploadFile = File(...), target_format: str = "pdf"):
             "Received file for conversion: task_id=%s filename=%s target=%s",
             task_id, filename, target_format,
         )
-        output_file = os.path.splitext(filename)[0] + "." + target_format
         output_path = os.path.join(work_dir, f"result.{target_format}")
-        convert(input_path, output_path, target_format)
+        output_path = str(convert(input_path, output_path, target_format, page=page))
+        output_ext = Path(output_path).suffix.lower()
+        output_file = os.path.splitext(filename)[0] + output_ext
         if not os.path.isfile(output_path):
             raise RuntimeError("输出文件不存在")
 
@@ -59,7 +64,9 @@ def convert_api(file: UploadFile = File(...), target_format: str = "pdf"):
         response = FileResponse(
             output_path,
             filename=output_file,
-            media_type="application/octet-stream",
+            media_type={".png": "image/png", ".jpg": "image/jpeg",
+                        ".jpeg": "image/jpeg"}.get(
+                            output_ext, "application/octet-stream"),
             background=BackgroundTask(shutil.rmtree, work_dir, ignore_errors=True),
         )
     except Exception as e:
