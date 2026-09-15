@@ -3,6 +3,27 @@
 `POST /convert?target_format=pdf`，通过 multipart 字段 `file` 上传文件。
 目标格式支持 `pdf`、`docx`、`xlsx`、`pptx`，响应为转换后的文件。
 
+## Docker Compose 启动
+
+```sh
+docker compose up -d
+docker compose logs -f libreoffice
+```
+
+默认使用 `ghcr.io/42tr/libreoffice:0.0.2`，监听宿主机 8000 端口，并发为 4。
+可以通过环境变量或同目录 `.env` 文件覆盖端口和转换配置，例如：
+
+```sh
+LIBREOFFICE_PORT=8080 LIBREOFFICE_MAX_CONCURRENCY=2 docker compose up -d
+```
+
+调用示例：
+
+```sh
+curl -f 'http://localhost:8000/convert?target_format=pdf' \
+  -F 'file=@example.docx' -o result.pdf
+```
+
 ## 并发配置
 
 | 环境变量 | 默认值 | 含义 |
