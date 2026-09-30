@@ -4,3 +4,7 @@
 __pycache__/
 *.pyc
 LibreOffice_*_Linux_*_deb.tar.gz
+tests/
+README.md
+docker-compose.yaml
+.env

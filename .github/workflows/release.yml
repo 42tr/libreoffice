@@ -8,8 +8,12 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
   docker:
     name: Build and push Docker image
+    needs: test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -41,6 +45,8 @@ jobs:
           push: true
           # Aliyun ACR personal edition does not support OCI provenance artifacts.
           provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           tags: |
             ghcr.io/42tr/libreoffice:${{ steps.meta.outputs.version }}
             ghcr.io/42tr/libreoffice:latest

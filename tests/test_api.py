@@ -1,3 +1,4 @@
+import asyncio
 import concurrent.futures
 import io
 import os
@@ -10,6 +11,7 @@ import time
 import unittest
 from unittest.mock import patch
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from PIL import Image
@@ -28,7 +30,9 @@ class ApiTests(unittest.TestCase):
         cls.sock = socket.socket()
         cls.sock.bind(('127.0.0.1', 0))
         cls.url = 'http://127.0.0.1:%s' % cls.sock.getsockname()[1]
-        cls.server = uvicorn.Server(uvicorn.Config(main.app, log_level='warning'))
+        # A small outer limit exercises the upload middleware without huge bodies.
+        app = main.UploadLimitMiddleware(main.app, max_bytes=64 * 1024)
+        cls.server = uvicorn.Server(uvicorn.Config(app, log_level='warning'))
         cls.thread = threading.Thread(target=cls.server.run, kwargs={'sockets': [cls.sock]}, daemon=True)
         cls.thread.start()
         deadline = time.monotonic() + 30
@@ -45,14 +49,18 @@ class ApiTests(unittest.TestCase):
         cls.base_patch.stop()
         cls.temp.cleanup()
 
-    def post(self, content=b'hello', fmt='pdf', filename='same.txt', with_headers=False, page=None):
+    def post(self, content=b'hello', fmt='pdf', filename='same.txt', with_headers=False, page=None,
+             dpi=None):
         boundary = 'conversion-test-boundary'
         body = (b'--' + boundary.encode() +
                 ('\r\nContent-Disposition: form-data; name="file"; filename="%s"\r\n' % filename).encode() +
                 b'Content-Type: text/plain\r\n\r\n' + content +
                 b'\r\n--' + boundary.encode() + b'--\r\n')
+        query = urllib.parse.urlencode({key: value for key, value in
+                                        [('target_format', fmt), ('page', page), ('dpi', dpi)]
+                                        if value is not None})
         request = urllib.request.Request(
-            self.url + '/convert?target_format=' + fmt + ('' if page is None else '&page=' + str(page)), data=body,
+            self.url + '/convert?' + query, data=body,
             headers={'Content-Type': 'multipart/form-data; boundary=' + boundary})
         try:
             with urllib.request.urlopen(request, timeout=240) as response:
@@ -73,7 +81,7 @@ class ApiTests(unittest.TestCase):
         barrier = threading.Barrier(3)
         release = threading.Event()
 
-        def convert(source, target, fmt, page=None):
+        def convert(source, target, fmt, page=None, dpi=None):
             barrier.wait(timeout=10)
             if not release.wait(timeout=10):
                 raise RuntimeError('conversion was not released')
@@ -99,8 +107,71 @@ class ApiTests(unittest.TestCase):
                               (subprocess.TimeoutExpired('soffice', 1), 504),
                               (RuntimeError('failed'), 500)]:
             with self.subTest(status=status), patch.object(main, 'convert', side_effect=error):
-                self.assertEqual(self.post()[0], status)
+                code, body = self.post()
+                self.assertEqual(code, status)
+                if status == 500:
+                    # Internal details stay in the log; the client gets a task id.
+                    self.assertNotIn(b'failed', body)
+                    self.assertIn('任务 ID'.encode(), body)
                 self.assert_clean()
+
+    def test_health(self):
+        with urllib.request.urlopen(self.url + '/health', timeout=2) as response:
+            self.assertEqual(response.status, 200)
+
+    def test_upload_limit_rejects_declared_length_before_body(self):
+        port = int(self.url.rsplit(':', 1)[1])
+        with socket.create_connection(('127.0.0.1', port), timeout=5) as conn, \
+                patch.object(main, 'convert') as convert:
+            # Only the headers are sent, as with curl's Expect: 100-continue.
+            conn.sendall(b'POST /convert HTTP/1.1\r\nHost: test\r\n'
+                         b'Content-Type: multipart/form-data; boundary=x\r\n'
+                         b'Content-Length: 104857600\r\n\r\n')
+            self.assertTrue(conn.recv(4096).startswith(b'HTTP/1.1 413 '))
+            convert.assert_not_called()
+        self.assert_clean()
+
+    def test_upload_limit_rejects_streamed_body(self):
+        boundary = b'conversion-test-boundary'
+        chunks = [b'--' + boundary + b'\r\nContent-Disposition: form-data; name="file"; '
+                  b'filename="big.txt"\r\n\r\n'] + [b'x' * 8192] * 16
+        messages = [{'type': 'http.request', 'body': chunk, 'more_body': True} for chunk in chunks]
+        sent = []
+
+        async def receive():
+            return messages.pop(0) if messages else {'type': 'http.disconnect'}
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {'type': 'http', 'asgi': {'version': '3.0'}, 'http_version': '1.1',
+                 'method': 'POST', 'scheme': 'http', 'path': '/convert', 'raw_path': b'/convert',
+                 'query_string': b'target_format=pdf', 'root_path': '',
+                 'headers': [(b'content-type', b'multipart/form-data; boundary=' + boundary),
+                             (b'transfer-encoding', b'chunked')],
+                 'server': ('test', 80), 'client': ('test', 1)}
+        with patch.object(main, 'convert') as convert:
+            asyncio.run(main.UploadLimitMiddleware(main.app, 64 * 1024)(scope, receive, send))
+            convert.assert_not_called()
+        self.assertEqual(sent[0]['status'], 413)
+        self.assertTrue(messages, 'the body should not be read past the limit')
+        self.assert_clean()
+
+    def test_response_media_type_and_filename(self):
+        def convert(source, target, fmt, page=None, dpi=None):
+            Path(target).write_bytes(b'converted')
+            return Path(target)
+
+        with patch.object(main, 'convert', side_effect=convert):
+            for fmt, media_type in [('pdf', 'application/pdf'),
+                                    ('DOCX', 'application/vnd.openxmlformats-officedocument.'
+                                             'wordprocessingml.document')]:
+                status, _, headers = self.post(fmt=fmt, filename='C:\\docs\\report.txt',
+                                               with_headers=True)
+                self.assertEqual(status, 200)
+                self.assertEqual(headers['Content-Type'], media_type)
+                self.assertIn('filename="report.%s"' % fmt.lower(), headers['Content-Disposition'])
+        self.assert_clean()
 
     @unittest.skipUnless(os.getenv('RUN_IMAGE_TESTS') == '1', 'requires pdftoppm')
     def test_real_pdf_images(self):
@@ -137,7 +208,13 @@ class ApiTests(unittest.TestCase):
     def test_invalid_page_parameters(self):
         for page in (0, -1, 'abc', '1.5'):
             self.assertEqual(self.post(fmt='png', page=page)[0], 422)
-        self.assertEqual(self.post(fmt='pdf', page=1)[0], 400)
+        for dpi in (49, 601, 'abc'):
+            self.assertEqual(self.post(fmt='png', dpi=dpi)[0], 422)
+        with patch.object(main, 'convert') as convert:
+            self.assertEqual(self.post(fmt='pdf', page=1)[0], 400)
+            self.assertEqual(self.post(fmt='pdf', dpi=150)[0], 400)
+            self.assertEqual(self.post(fmt='bmp')[0], 400)
+            convert.assert_not_called()
         self.assert_clean()
 
     @unittest.skipUnless(os.getenv('RUN_IMAGE_TESTS') == '1', 'requires pdftoppm')
@@ -163,13 +240,13 @@ class ApiTests(unittest.TestCase):
         guard = threading.Lock()
         active = peak = 0
 
-        def run(command):
+        def run(command, *args, **kwargs):
             nonlocal active, peak
             with guard:
                 active += 1
                 peak = max(peak, active)
             try:
-                return real_run(command)
+                return real_run(command, *args, **kwargs)
             finally:
                 with guard:
                     active -= 1
@@ -190,7 +267,9 @@ class ApiTests(unittest.TestCase):
                         self.assertTrue(body.startswith(b'%PDF-'), body[:100])
         self.assertEqual(peak, min(4, client.MAX_CONCURRENCY))
         self.assert_clean()
-        self.assertEqual(list(client.CLI_PROFILE_DIR.iterdir()), [])
+        # Job directories are removed; per-slot profiles stay for reuse.
+        self.assertEqual([path.name for path in client.CLI_PROFILE_DIR.iterdir()
+                          if not path.name.startswith('profile-')], [])
         print('Real conversions: 4 successful, peak=%s, elapsed=%.2fs' %
               (peak, time.monotonic() - start), flush=True)
 
